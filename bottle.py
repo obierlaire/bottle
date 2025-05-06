@@ -1948,6 +1948,9 @@ class JSONPlugin:
 
     def __init__(self, json_dumps=json_dumps):
         self.json_dumps = json_dumps
+        # Cache for frequently serialized objects
+        self._cache = {}
+        self._cache_size = 100  # Limit cache size to prevent memory bloat
 
     def setup(self, app):
         app.config._define('json.enable', default=True, validate=bool,
@@ -1961,9 +1964,40 @@ class JSONPlugin:
                                " dict into json. The other options no longer"
                                " apply.")
 
+    def _get_cached_json(self, obj):
+        """Try to get a cached JSON serialization of an object.
+        
+        For simple, immutable objects, this can avoid repeated serialization.
+        Only caches objects that are hashable."""
+        try:
+            cache_key = hash(frozenset(obj.items()))
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+            return None
+        except (TypeError, AttributeError):
+            # Object is not hashable or not a dict-like object
+            return None
+
+    def _cache_json(self, obj, json_str):
+        """Cache the JSON serialization of an object."""
+        try:
+            if len(self._cache) >= self._cache_size:
+                # Simple cache eviction - clear half the cache when full
+                # More sophisticated LRU policy could be implemented if needed
+                keys = list(self._cache.keys())[:self._cache_size // 2]
+                for k in keys:
+                    del self._cache[k]
+                    
+            cache_key = hash(frozenset(obj.items()))
+            self._cache[cache_key] = json_str
+        except (TypeError, AttributeError):
+            # Object is not hashable or not a dict-like object
+            pass
+
     def apply(self, callback, route):
         dumps = self.json_dumps
-        if not self.json_dumps: return callback
+        if not dumps: 
+            return callback
 
         @functools.wraps(callback)
         def wrapper(*a, **ka):
@@ -1972,15 +2006,41 @@ class JSONPlugin:
             except HTTPResponse as resp:
                 rv = resp
 
+            # Early return for common non-JSON cases
+            if rv is None or isinstance(rv, (str, bytes)) or callable(getattr(rv, 'read', None)):
+                return rv
+
             if isinstance(rv, dict):
+                # Check cache first for common patterns
+                cached_json = self._get_cached_json(rv)
+                if cached_json:
+                    response.content_type = 'application/json'
+                    return cached_json
+                
                 # Attempt to serialize, raises exception on failure
                 json_response = dumps(rv)
+                
+                # Cache the result for future use
+                self._cache_json(rv, json_response)
+                
                 # Set content type only if serialization successful
                 response.content_type = 'application/json'
                 return json_response
-            elif isinstance(rv, HTTPResponse) and isinstance(rv.body, dict):
+            elif isinstance(rv, HTTPResponse):
+                if not isinstance(rv.body, dict):
+                    return rv
+                    
+                # Check cache for the response body
+                cached_json = self._get_cached_json(rv.body)
+                if cached_json:
+                    rv.body = cached_json
+                    rv.content_type = 'application/json'
+                    return rv
+                
+                # Serialize the body
                 rv.body = dumps(rv.body)
                 rv.content_type = 'application/json'
+            
             return rv
 
         return wrapper
